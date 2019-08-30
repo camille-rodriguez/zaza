@@ -264,7 +264,8 @@ class TestCharmLifecycleDeploy(ut_utils.BaseTestCase):
         self.deploy_bundle.assert_called_once_with('bun.yaml', 'newmodel')
         self.wait_for_application_states.assert_called_once_with(
             'newmodel',
-            {})
+            {},
+            4200)
 
     def test_deploy_bespoke_states(self):
         self.patch_object(lc_deploy.zaza.model, 'wait_for_application_states')
@@ -281,7 +282,8 @@ class TestCharmLifecycleDeploy(ut_utils.BaseTestCase):
             'newmodel',
             {'vault': {
                 'workload-status': 'blocked',
-                'workload-status-message': 'Vault needs to be inited'}})
+                'workload-status-message': 'Vault needs to be inited'}},
+            4200)
 
     def test_deploy_nowait(self):
         self.patch_object(lc_deploy.zaza.model, 'wait_for_application_states')

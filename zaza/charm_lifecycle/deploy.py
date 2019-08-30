@@ -265,7 +265,8 @@ def deploy(bundle, model, wait=True):
         zaza.model.set_juju_model(model)
         zaza.model.wait_for_application_states(
             model,
-            test_config.get('target_deploy_status', {}))
+            test_config.get('target_deploy_status', {}),
+            4200)
         run_report.register_event_finish('Wait for Deployment')
 
 
