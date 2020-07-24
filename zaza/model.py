@@ -33,8 +33,10 @@ from juju.errors import JujuError
 from juju.model import Model
 
 from zaza import sync_wrapper
+import zaza.utilities.generic as generic_utils
 
 CURRENT_MODEL = None
+MODEL_ALIASES = {}
 
 
 class ModelTimeout(Exception):
@@ -52,6 +54,31 @@ def set_juju_model(model_name):
     global CURRENT_MODEL
     os.environ["JUJU_MODEL"] = model_name
     CURRENT_MODEL = model_name
+
+
+def set_juju_model_aliases(model_aliases):
+    """Store the model aliases in a global.
+
+    :param model_aliases: Model alias map to store
+    :type model_aliases: dict
+    """
+    global MODEL_ALIASES
+    MODEL_ALIASES = model_aliases
+
+
+def get_juju_model_aliases():
+    """Return the model aliases from global.
+
+    :returns: Model alias map
+    :rtype: dict
+    """
+    global MODEL_ALIASES
+    return MODEL_ALIASES
+
+
+def unset_juju_model_aliases():
+    """Remove model alias data."""
+    set_juju_model_aliases({})
 
 
 async def async_get_juju_model():
@@ -260,8 +287,14 @@ async def async_run_on_unit(unit_name, command, model_name=None, timeout=None):
     async with run_in_model(model_name) as model:
         unit = get_unit_from_name(unit_name, model)
         action = await unit.run(command, timeout=timeout)
-        if action.data.get('results'):
-            return action.data.get('results')
+        results = action.data.get('results')
+        if results:
+            # In Juju 2.7 some keys are dropped from the results if there
+            # value was empty. This breaks some functions downstream, so
+            # ensure the keys are always present.
+            for key in ['Stderr', 'Stdout']:
+                results[key] = results.get(key, '')
+            return results
         else:
             return {}
 
@@ -319,11 +352,16 @@ get_unit_time = sync_wrapper(async_get_unit_time)
 async def async_get_unit_service_start_time(unit_name, service,
                                             model_name=None, timeout=None,
                                             pgrep_full=False):
-    """Return the time that the given service was started on a unit.
+    r"""Return the time that the given service was started on a unit.
 
-    Return the time (in seconds since Epoch) that the given service was
-    started on the given unit. If the service is not running raise
-    ServiceNotRunning exception.
+    Return the time (in seconds since Epoch) that the oldest process of the
+    given service was started on the given unit. If the service is not running
+    raise ServiceNotRunning exception.
+
+    If pgrep_full is True  ensure that any special characters in the name of
+    the service are escaped e.g.
+
+        service = 'aodh-evaluator: AlarmEvaluationService worker\(0\)'
 
     :param model_name: Name of model to query.
     :type model_name: str
@@ -341,10 +379,16 @@ async def async_get_unit_service_start_time(unit_name, service,
     :raises: ServiceNotRunning
     """
     if pgrep_full:
-        pid_cmd = 'pgrep -f "{}"'.format(service)
+        pid_cmd = r"pgrep -o -f '{}'".format(service)
+        cmd = "stat -c %Y /proc/$({})".format(pid_cmd)
     else:
-        pid_cmd = "pidof -x {}".format(service)
-    cmd = "stat -c %Y /proc/$({} | cut -f1 -d ' ')".format(pid_cmd)
+        pid_cmd = r"pidof -x '{}'".format(service)
+        cmd = pid_cmd + (
+            "| "
+            r"tr -d '\n' | "
+            "xargs -d' ' -I {} stat -c %Y /proc/{}  | "
+            "sort -n |"
+            " head -1")
     out = await async_run_on_unit(
         unit_name=unit_name,
         command=cmd,
@@ -424,13 +468,13 @@ def get_first_unit_name(application_name, model_name=None):
 
 
 async def async_get_lead_unit_name(application_name, model_name=None):
-    """Return name of lowest numbered unit of given application.
+    """Return name of unit with leader status for given application.
 
     :param model_name: Name of model to query.
     :type model_name: str
     :param application_name: Name of application
     :type application_name: str
-    :returns: Name of lowest numbered unit
+    :returns: Name of unit with leader status
     :rtype: str
     """
     async with run_in_model(model_name) as model:
@@ -456,6 +500,26 @@ def get_app_ips(application_name, model_name=None):
             for u in get_units(application_name, model_name=model_name)]
 
 
+async def async_get_lead_unit_ip(application_name, model_name=None):
+    """Return the IP address of the lead unit of a given application.
+
+    :param model_name: Name of model to query.
+    :type model_name: str
+    :param application_name: Name of application
+    :type application_name: str
+    :returns: IP of the lead unit
+    :rtype: str
+    """
+    async with run_in_model(model_name) as model:
+        for unit in model.applications[application_name].units:
+            is_leader = await unit.is_leader_from_status()
+            if is_leader:
+                return unit.public_address
+
+
+get_lead_unit_ip = sync_wrapper(async_get_lead_unit_ip)
+
+
 async def async_get_application_config(application_name, model_name=None):
     """Return application configuration.
 
@@ -470,6 +534,24 @@ async def async_get_application_config(application_name, model_name=None):
         return await model.applications[application_name].get_config()
 
 get_application_config = sync_wrapper(async_get_application_config)
+
+
+async def async_reset_application_config(application_name, config_keys,
+                                         model_name=None):
+    """Reset application configuration to default values.
+
+    :param model_name: Name of model to query.
+    :type model_name: str
+    :param application_name: Name of application
+    :type application_name: str
+    :param config_keys: List of configuration keys to reset to their defaults.
+    :type config_keys: List[str]
+    """
+    async with run_in_model(model_name) as model:
+        return await (model.applications[application_name]
+                      .reset_config(config_keys))
+
+reset_application_config = sync_wrapper(async_reset_application_config)
 
 
 async def async_set_application_config(application_name, configuration,
@@ -509,17 +591,20 @@ class ActionFailed(Exception):
 
     def __init__(self, action):
         """Set information about action failure in message and raise."""
-        message = ('Run of action "{}" with parameters "{}" on "{}" failed '
-                   'with "{}" (id={} status={} enqueued={} started={} '
-                   'completed={})'
-                   .format(action.name, action.parameters, action.receiver,
-                           action.message, action.id, action.status,
-                           action.enqueued, action.started, action.completed))
+        params = {key: getattr(action, key, "<not-set>")
+                  for key in ['name', 'parameters', 'receiver',
+                              'message', 'id', 'status',
+                              'enqueued', 'started', 'completed']}
+        message = ('Run of action "{name}" with parameters "{parameters}" on '
+                   '"{receiver}" failed with "{message}" (id={id} '
+                   'status={status} enqueued={enqueued} started={started} '
+                   'completed={completed})'
+                   .format(**params))
         super(ActionFailed, self).__init__(message)
 
 
 async def async_run_action(unit_name, action_name, model_name=None,
-                           action_params={}, raise_on_failure=False):
+                           action_params=None, raise_on_failure=False):
     """Run action on given unit.
 
     :param unit_name: Name of unit to run action on
@@ -536,6 +621,9 @@ async def async_run_action(unit_name, action_name, model_name=None,
     :rtype: juju.action.Action
     :raises: ActionFailed
     """
+    if action_params is None:
+        action_params = {}
+
     async with run_in_model(model_name) as model:
         unit = get_unit_from_name(unit_name, model)
         action_obj = await unit.run_action(action_name, **action_params)
@@ -566,6 +654,9 @@ async def async_run_action_on_leader(application_name, action_name,
     :rtype: juju.action.Action
     :raises: ActionFailed
     """
+    if action_params is None:
+        action_params = {}
+
     async with run_in_model(model_name) as model:
         for unit in model.applications[application_name].units:
             is_leader = await unit.is_leader_from_status()
@@ -578,6 +669,55 @@ async def async_run_action_on_leader(application_name, action_name,
                 return action_obj
 
 run_action_on_leader = sync_wrapper(async_run_action_on_leader)
+
+
+async def async_run_action_on_units(units, action_name, action_params=None,
+                                    model_name=None, raise_on_failure=False,
+                                    timeout=600):
+    """Run action on list of unit in parallel.
+
+    The action is run on all units first without waiting for the action to
+    complete. Then block until they are done.
+
+    :param units: List of unit names
+    :type units: List[str]
+    :param action_name: Name of action to run
+    :type action_name: str
+    :param action_params: Dictionary of config options for action
+    :type action_params: dict
+    :param model_name: Name of model to query.
+    :type model_name: str
+    :param raise_on_failure: Raise ActionFailed exception on failure
+    :type raise_on_failure: bool
+    :param timeout: Time to wait for actions to complete
+    :type timeout: int
+    :returns: Action object
+    :rtype: juju.action.Action
+    :raises: ActionFailed
+    """
+    if action_params is None:
+        action_params = {}
+
+    async with run_in_model(model_name) as model:
+        actions = []
+        for unit_name in units:
+            unit = get_unit_from_name(unit_name, model)
+            action_obj = await unit.run_action(action_name, **action_params)
+            actions.append(action_obj)
+
+        async def _check_actions():
+            for action_obj in actions:
+                if action_obj.status in ['running', 'pending']:
+                    return False
+            return True
+
+        await async_block_until(_check_actions, timeout=timeout)
+
+        for action_obj in actions:
+            if raise_on_failure and action_obj.status != 'completed':
+                raise ActionFailed(action_obj)
+
+run_action_on_units = sync_wrapper(async_run_action_on_units)
 
 
 async def async_remove_application(application_name, model_name=None,
@@ -843,40 +983,58 @@ async def async_wait_for_application_states(model_name=None, states=None,
         errored_units = units_with_wl_status_state(model, 'error')
         if errored_units:
             raise UnitError(errored_units)
-        try:
-            for application, app_data in model.applications.items():
-                check_info = states.get(application, {})
-                for unit in app_data.units:
-                    app_wls = check_info.get('workload-status')
-                    if app_wls:
-                        all_approved_statuses = approved_statuses + [app_wls]
-                    else:
-                        all_approved_statuses = approved_statuses
-                    logging.info("Checking workload status of {}".format(
-                        unit.entity_id))
+
+        timeout_msg = (
+            "Timed out waiting for '{unit_name}'. The {gate_attr} "
+            "is '{unit_state}' which is not one of '{approved_states}'")
+        for application, app_data in model.applications.items():
+            check_info = states.get(application, {})
+            for unit in app_data.units:
+                app_wls = check_info.get('workload-status')
+                if app_wls:
+                    all_approved_statuses = approved_statuses + [app_wls]
+                else:
+                    all_approved_statuses = approved_statuses
+                logging.info("Checking workload status of {}".format(
+                    unit.entity_id))
+                try:
                     await model.block_until(
                         lambda: check_unit_workload_status(
                             model,
                             unit,
                             all_approved_statuses),
                         timeout=timeout)
-                    check_msg = check_info.get('workload-status-message')
-                    logging.info("Checking workload status message of {}"
-                                 .format(unit.entity_id))
+                except concurrent.futures._base.TimeoutError:
+                    raise ModelTimeout(
+                        timeout_msg.format(
+                            unit_name=unit.entity_id,
+                            gate_attr='workload status',
+                            unit_state=unit.workload_status,
+                            approved_states=all_approved_statuses))
+
+                check_msg = check_info.get('workload-status-message')
+                logging.info("Checking workload status message of {}"
+                             .format(unit.entity_id))
+                prefixes = approved_message_prefixes
+                if check_msg is not None:
+                    prefixes = approved_message_prefixes + [check_msg]
+                else:
                     prefixes = approved_message_prefixes
-                    if check_msg is not None:
-                        prefixes = approved_message_prefixes + [check_msg]
-                    else:
-                        prefixes = approved_message_prefixes
+                try:
                     await model.block_until(
                         lambda: check_unit_workload_status_message(
                             model,
                             unit,
                             prefixes=prefixes),
                         timeout=timeout)
-        except concurrent.futures._base.TimeoutError:
-            raise ModelTimeout("Zaza has timed out waiting on the model to "
-                               "reach expected workload statuses.")
+                except concurrent.futures._base.TimeoutError:
+                    raise ModelTimeout(
+                        timeout_msg.format(
+                            unit_name=unit.entity_id,
+                            gate_attr='workload status message',
+                            unit_state=unit.workload_status_message,
+                            approved_states=prefixes))
+
 
 wait_for_application_states = sync_wrapper(async_wait_for_application_states)
 
@@ -903,6 +1061,66 @@ async def async_block_until_all_units_idle(model_name=None, timeout=2700):
             raise UnitError(errored_units)
 
 block_until_all_units_idle = sync_wrapper(async_block_until_all_units_idle)
+
+
+async def async_block_until_unit_count(application, target_count,
+                                       model_name=None, timeout=2700):
+    """Block until the number of units matches target_count.
+
+    An example accessing this function via its sync wrapper::
+
+        block_until_unit_count('keystone', 4)
+
+    :param application_name: Name of application
+    :type application_name: str
+    :param target_count: Number of expected units.
+    :type target_count: int
+    :param model_name: Name of model to interact with.
+    :type model_name: str
+    :param timeout: Time to wait for status to be achieved
+    :type timeout: float
+    """
+    async def _check_unit():
+        model_status = await async_get_status()
+        unit_count = len(model_status.applications[application]['units'])
+        return unit_count == target_count
+
+    assert target_count == int(target_count), "target_count not an int"
+    async with run_in_model(model_name):
+        await async_block_until(_check_unit, timeout=timeout)
+
+block_until_unit_count = sync_wrapper(
+    async_block_until_unit_count)
+
+
+async def async_block_until_charm_url(application, target_url,
+                                      model_name=None, timeout=2700):
+    """Block until the charm url matches target_url.
+
+    An example accessing this function via its sync wrapper::
+
+        block_until_charm_url('cinder', 'cs:openstack-charmers-next/cinder')
+
+    :param application_name: Name of application
+    :type application_name: str
+    :param target_url: Target charm url
+    :type target_url: str
+    :param model_name: Name of model to interact with.
+    :type model_name: str
+    :param timeout: Time to wait for status to be achieved
+    :type timeout: float
+    """
+    async def _check_charm_url():
+        model_status = await async_get_status()
+        charm_url = model_status.applications[application]['charm']
+        return charm_url == target_url
+
+    async with run_in_model(model_name):
+        await async_block_until(_check_charm_url, timeout=timeout)
+
+
+block_until_charm_url = sync_wrapper(
+    async_block_until_charm_url)
 
 
 async def async_block_until_service_status(unit_name, services, target_status,
@@ -936,9 +1154,9 @@ async def async_block_until_service_status(unit_name, services, target_status,
     async def _check_service():
         for service in services:
             if pgrep_full:
-                command = 'pgrep -f "{}"'.format(service)
+                command = r"pgrep -f '{}'".format(service)
             else:
-                command = "pidof -x {}".format(service)
+                command = r"pidof -x '{}'".format(service)
             out = await async_run_on_unit(
                 unit_name,
                 command,
@@ -1022,6 +1240,9 @@ async def async_block_until(*conditions, timeout=None, wait_period=0.5,
     await asyncio.wait_for(_block(), timeout, loop=loop)
 
 
+block_until = sync_wrapper(async_block_until)
+
+
 async def async_block_until_file_ready(application_name, remote_file,
                                        check_function, model_name=None,
                                        timeout=2700):
@@ -1048,14 +1269,14 @@ async def async_block_until_file_ready(application_name, remote_file,
         for unit in units:
             try:
                 output = await unit.run('cat {}'.format(remote_file))
-                contents = output.data.get('results')['Stdout']
+                contents = output.data.get('results').get('Stdout', '')
                 if not check_function(contents):
                     return False
             # libjuju throws a generic error for connection failure. So we
             # cannot differentiate between a connectivity issue and a
             # target file not existing error. For now just assume the
             # latter.
-            except JujuError as e:
+            except JujuError:
                 return False
         else:
             return True
@@ -1103,6 +1324,52 @@ async def async_block_until_file_has_contents(application_name, remote_file,
 
 block_until_file_has_contents = sync_wrapper(
     async_block_until_file_has_contents)
+
+
+async def async_block_until_file_missing(
+        app, path, model_name=None, timeout=2700):
+    """Block until the file at path is not there.
+
+    Block until the file at the param 'path' is not present on the file system
+    for all units on a given application.
+
+    An example accessing this function via its sync wrapper::
+
+        block_until_file_missing(
+            'keystone',
+            '/some/path/name')
+
+
+    :param app: the application name
+    :type app: str
+    :param path: the file name to check for.
+    :type path: str
+    :param model_name: Name of model to query.
+    :type model_name: str
+    :param timeout: Time to wait for contents to appear in file
+    :type timeout: float
+    """
+    async def _check_for_file(model):
+        units = model.applications[app].units
+        results = []
+        for unit in units:
+            try:
+                output = await unit.run('test -e "{}"; echo $?'.format(path))
+                contents = output.data.get('results')['Stdout']
+                results.append("1" in contents)
+            # libjuju throws a generic error for connection failure. So we
+            # cannot differentiate between a connectivity issue and a
+            # target file not existing error. For now just assume the
+            # latter.
+            except JujuError:
+                results.append(False)
+        return all(results)
+
+    async with run_in_model(model_name) as model:
+        await async_block_until(lambda: _check_for_file(model),
+                                timeout=timeout)
+
+block_until_file_missing = sync_wrapper(async_block_until_file_missing)
 
 
 async def async_block_until_oslo_config_entries_match(application_name,
@@ -1227,7 +1494,8 @@ block_until_services_restarted = sync_wrapper(
 
 
 async def async_block_until_unit_wl_status(unit_name, status, model_name=None,
-                                           negate_match=False, timeout=2700):
+                                           negate_match=False, timeout=2700,
+                                           subordinate_principal=None):
     """Block until the given unit has the desired workload status.
 
     A units workload status may change during a given action. This function
@@ -1252,12 +1520,35 @@ async def async_block_until_unit_wl_status(unit_name, status, model_name=None,
     :type negate_match: bool
     :param timeout: Time to wait for unit to achieved desired status
     :type timeout: float
+    :param subordinate_principal: Name of the principal of unit_name, if
+                                  unit_name is a subordinate
+    :type subordinate_principal: str
     """
     async def _unit_status():
         app = unit_name.split("/")[0]
         model_status = await async_get_status()
-        v = model_status.applications[app]['units'][unit_name][
-            'workload-status']['status']
+        try:
+            v = model_status.applications[app]['units'][unit_name][
+                'workload-status']['status']
+        except (TypeError, KeyError):
+            # For when the unit is a subordinate we need to get it's
+            # leader, and then get the status for the subordinate from its
+            # unit
+            lead_app_name = subordinate_principal
+            if not subordinate_principal:
+                lead_app_name = model_status.applications[app][
+                    'subordinate-to'][0]
+            units = model_status.applications[lead_app_name]['units']
+            for unit in units.values():
+                try:
+                    v = unit['subordinates'][unit_name][
+                        'workload-status']['status']
+                    break
+                except KeyError:
+                    pass
+            else:  # pragma: no cover
+                raise ValueError('{} does not exist as a subordinate under a '
+                                 'principal'.format(unit_name))
         if negate_match:
             return v != status
         else:
@@ -1268,6 +1559,43 @@ async def async_block_until_unit_wl_status(unit_name, status, model_name=None,
 
 block_until_unit_wl_status = sync_wrapper(
     async_block_until_unit_wl_status)
+
+
+async def async_block_until_wl_status_info_starts_with(
+        app, status, model_name=None, negate_match=False, timeout=2700):
+    """Block until the all the units have a desired workload status.
+
+    Block until all of the units have a desired workload status that starts
+    with the string in the status param.
+
+    :param app: the application to check against
+    :type app: str
+    :param status: Status to wait for at the start of the string
+    :type status: str
+    :param model_name: Name of model to query.
+    :type model_name: Union[None, str]
+    :param negate_match: Wait until the match is not true; i.e. none match
+    :type negate_match: Union[None, bool]
+    :param timeout: Time to wait for unit to achieved desired status
+    :type timeout: float
+    """
+    async def _unit_status():
+        model_status = await async_get_status()
+        wl_infos = [v['workload-status']['info']
+                    for k, v in model_status.applications[app]['units'].items()
+                    if k.split('/')[0] == app]
+        g = (s.startswith(status) for s in wl_infos)
+        if negate_match:
+            return not(any(g))
+        else:
+            return all(g)
+
+    async with run_in_model(model_name):
+        await async_block_until(_unit_status, timeout=timeout)
+
+
+block_until_wl_status_info_starts_with = sync_wrapper(
+    async_block_until_wl_status_info_starts_with)
 
 
 async def async_get_relation_id(application_name, remote_application_name,
@@ -1297,6 +1625,107 @@ async def async_get_relation_id(application_name, remote_application_name,
                 return(rel.id)
 
 get_relation_id = sync_wrapper(async_get_relation_id)
+
+
+async def async_add_relation(application_name, local_relation, remote_relation,
+                             model_name=None):
+    """
+    Add relation between applications.
+
+    :param application_name: Name of application on this side of relation
+    :type application_name: str
+    :param local_relation: Name of relation on this application
+    :type local_relation: str
+    :param remote_relation: Name of relation on the other application.
+    :type remote_relation: str ‘<application>[:<relation_name>]’
+    :param model_name: Name of model to operate on.
+    :type model_name: str
+    """
+    async with run_in_model(model_name) as model:
+        app = model.applications[application_name]
+        await app.add_relation(local_relation, remote_relation)
+
+add_relation = sync_wrapper(async_add_relation)
+
+
+async def async_remove_relation(application_name, local_relation,
+                                remote_relation, model_name=None):
+    """
+    Remove relation between applications.
+
+    :param application_name: Name of application on this side of relation
+    :type application_name: str
+    :param local_relation: Name of relation on this application
+    :type local_relation: str
+    :param remote_relation: Name of relation on the other application.
+    :type remote_relation: str ‘<application>[:<relation_name>]’
+    :param model_name: Name of model to operate on.
+    :type model_name: str
+    """
+    async with run_in_model(model_name) as model:
+        app = model.applications[application_name]
+        await app.destroy_relation(local_relation, remote_relation)
+
+remove_relation = sync_wrapper(async_remove_relation)
+
+
+async def async_add_unit(application_name, count=1, to=None, model_name=None,
+                         wait_appear=False):
+    """
+    Add unit(s) to an application.
+
+    :param application_name: Name of application to add unit(s) to
+    :type application_name: str
+    :param count: Number of units to add
+    :type count: int
+    :param to: Location to add unit i.e. lxd:0
+    :type to: str
+    :param model_name: Name of model to operate on.
+    :type model_name: str
+    :param wait_appear: Whether to wait for the unit to appear in juju status
+    :type wait_appear: bool
+    """
+    async with run_in_model(model_name) as model:
+        app = model.applications[application_name]
+        current_unit_count = len(app.units)
+        await app.add_unit(count=count, to=to)
+        if wait_appear:
+            target_count = current_unit_count + count
+            await async_block_until_unit_count(
+                application_name,
+                target_count,
+                model_name=model_name)
+
+add_unit = sync_wrapper(async_add_unit)
+
+
+async def async_destroy_unit(application_name, *unit_names, model_name=None,
+                             wait_disappear=False):
+    """
+    Remove unit(s) of an application.
+
+    :param application_name: Name of application to remove unit(s) from
+    :type application_name: str
+    :parm unit_names: One or more unit names. i.e. app/0
+    :type unit_name: str(s)
+    :param model_name: Name of model to operate on.
+    :type model_name: str
+    :param wait_disappear: Whether to wait for the unit to disappear from juju
+                           status
+    :type wait_disappear: bool
+    """
+    async with run_in_model(model_name) as model:
+        app = model.applications[application_name]
+        current_unit_count = len(app.units)
+        await app.destroy_unit(*unit_names)
+        if wait_disappear:
+            target_count = current_unit_count - len(unit_names)
+            await async_block_until_unit_count(
+                application_name,
+                target_count,
+                model_name=model_name)
+
+destroy_unit = sync_wrapper(async_destroy_unit)
 
 
 def set_model_constraints(constraints, model_name=None):
@@ -1361,6 +1790,26 @@ async def async_upgrade_charm(application_name, channel=None,
             switch=switch)
 
 upgrade_charm = sync_wrapper(async_upgrade_charm)
+
+
+async def async_get_latest_charm_url(charm_url, channel=None, model_name=None):
+    """Get charm url, including revision number, for latest charm version.
+
+    :param charm_url: Charm url without revision number
+    :type charm_url: str
+    :param channel: Channel to use when getting the charm from the charm store,
+                    e.g. 'development'
+    :type channel: str
+    :param model_name: Name of model to operate on
+    :type model_name: str
+    """
+    async with run_in_model(model_name) as model:
+        charmstore_entity = await model.charmstore.entity(
+            charm_url,
+            channel=channel)
+        return charmstore_entity['Id']
+
+get_latest_charm_url = sync_wrapper(async_get_latest_charm_url)
 
 
 class UnitNotFound(Exception):
@@ -1452,3 +1901,118 @@ def attach_resource(application, resource_name, resource_path):
     cmd = ["juju", "attach-resource", "-m", juju_model,
            application, "{}={}".format(resource_name, resource_path)]
     subprocess.check_call(cmd)
+
+
+async def async_run_on_machine(
+    machine,
+    command,
+    model_name=None,
+    timeout=None
+):
+    """Juju run on unit.
+
+    This function uses a spawned process to run the `juju run` command rather
+    that a native libjuju call as libjuju hasn't implemented `juju.Machine.run`
+    yet: https://github.com/juju/python-libjuju/issues/403
+
+    :param model_name: Name of model unit is in
+    :type model_name: str
+    :param unit_name: Name of unit to match
+    :type unit: str
+    :param command: Command to execute
+    :type command: str
+    :param timeout: How long in seconds to wait for command to complete
+    :type timeout: int
+    :returns: action.data['results'] {'Code': '', 'Stderr': '', 'Stdout': ''}
+    :rtype: dict
+    """
+    cmd = ['juju', 'run', '--machine={}'.format(machine)]
+    if model_name:
+        cmd.append('--model={}'.format(model_name))
+    if timeout:
+        cmd.append('--timeout={}'.format(timeout))
+    cmd.append(command)
+    logging.info("About to call '{}'".format(cmd))
+    await generic_utils.check_call(cmd)
+
+
+run_on_machine = sync_wrapper(async_run_on_machine)
+
+
+async def async_wait_for_unit_idle(
+    unit_name,
+    timeout=600,
+    include_subordinates=False
+):
+    """Wait until the unit's agent is idle.
+
+    :param unit_name: The unit name of the application, ex: mysql/0
+    :type unit_name: str
+    :param timeout: How long to wait before timing out
+    :type timeout: int
+    :param include_subordinates: Should this function wait for subordinate idle
+    :type include_subordinates: bool
+    :returns: None
+    :rtype: None
+    """
+    app = unit_name.split('/')[0]
+
+    def _unit_idle(app, unit_name):
+        async def f():
+            x = await async_get_agent_status(app, unit_name)
+            if include_subordinates:
+                subs_idle = await async_check_if_subordinates_idle(
+                    app, unit_name)
+            else:
+                subs_idle = True
+            return x == "idle" and subs_idle
+        return f
+
+    try:
+        await async_block_until(
+            _unit_idle(app, unit_name),
+            timeout=timeout)
+    except concurrent.futures._base.TimeoutError:
+        raise ModelTimeout("Zaza has timed out waiting on {} to "
+                           "reach idle state.".format(unit_name))
+
+
+wait_for_unit_idle = sync_wrapper(async_wait_for_unit_idle)
+
+
+async def async_get_agent_status(app, unit_name):
+    """Get the current status of the specified unit.
+
+    :param app: The name of the Juju application, ex: mysql
+    :type app: str
+    :param unit_name: The unit name of the application, ex: mysql/0
+    :type unit_name: str
+    :returns: The agent status, either active / idle, returned by Juju
+    :rtype: str
+    """
+    return (await async_get_status()). \
+        applications[app]['units'][unit_name]['agent-status']['status']
+
+
+get_agent_status = sync_wrapper(async_get_agent_status)
+
+
+async def async_check_if_subordinates_idle(app, unit_name):
+    """Check if the specified unit's subordinatesare idle.
+
+    :param app: The name of the Juju application, ex: mysql
+    :type app: str
+    :param unit_name: The unit name of the application, ex: mysql/0
+    :type unit_name: str
+    :returns: The agent status, either active / idle, returned by Juju
+    :rtype: str
+    """
+    status = await async_get_status()
+    subordinates = status.applications[app]['units'][unit_name].get(
+        'subordinates', [])
+    if not subordinates:
+        return True
+    statuses = [
+        unit['agent-status']['status']
+        for name, unit in subordinates.items()]
+    return len(set(statuses)) == 1 and statuses[0] == 'idle'
